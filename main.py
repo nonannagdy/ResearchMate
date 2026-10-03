@@ -1,4 +1,4 @@
-# ResearchMate - Simple automated literature review agent
+﻿# ResearchMate - Simple automated literature review agent
 # Runs inside Hermes environment, uses only free tools.
 import os
 import sys
@@ -53,42 +53,71 @@ def run_hermes_chat(prompt):
     return response
 
 def search_arxiv(query, max_results=5):
-    """Search arXiv and return list of (id, title)."""
-    # Use Lucene phrase-based query with proper encoding
+    """Search arXiv and return a list of (id, title)."""
+    import urllib.request
     import urllib.parse
+    import xml.etree.ElementTree as ET
+
     stop_words = {'of', 'the', 'and', 'for', 'in', 'to', 'a', 'is', 'with', 'on'}
-    query_terms = [f'all:{w}' for w in query.split() if w.lower() not in stop_words]
-    q = urllib.parse.quote_plus(" AND ".join(query_terms[:2]))
-    url = f'https://export.arxiv.org/api/query?search_query={q}&max_results={max_results}&sortBy=submittedDate&sortOrder=descending'
-    print(f"DEBUG: URL: {url}")
-    result = terminal(command=f'curl -s {json.dumps(url)}')
-    xml = result.get('output', '')
-    if not xml:
-        print("DEBUG: Empty response from arXiv")
-    else:
-        print(f"DEBUG: Response length: {len(xml)}")
-    # Simple parsing using python one-liner
-    parse_cmd = f'''
-import sys, xml.etree.ElementTree as ET, json
-root = ET.fromstring(sys.stdin.read())
-entries = []
-for entry in root.findall('{{http://www.w3.org/2005/Atom}}entry'):
-    id_el = entry.find('{{http://www.w3.org/2005/Atom}}id')
-    title_el = entry.find('{{http://www.w3.org/2005/Atom}}title')
-    if id_el is not None and title_el is not None:
-        arxiv_id = id_el.text.split('/abs/')[-1]
-        title = title_el.text.strip()
-        entries.append((arxiv_id, title))
-print(json.dumps(entries))
-'''
-    # Pipe xml to python
-    proc = subprocess.run(['python', '-c', parse_cmd], input=xml.encode(), capture_output=True)
-    out = proc.stdout.decode().strip()
-    try:
-        return json.loads(out)
-    except Exception:
+    query_terms = [
+        w for w in query.split()
+        if w.lower() not in stop_words
+    ]
+
+    if not query_terms:
         return []
 
+    search_query = " AND ".join(f"all:{w}" for w in query_terms)
+
+    params = urllib.parse.urlencode({
+        "search_query": search_query,
+        "max_results": max_results,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending"
+    })
+
+    url = f"https://export.arxiv.org/api/query?{params}"
+
+    print(f"DEBUG: URL: {url}")
+
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "ResearchMate/1.0 (research assistant)"
+            }
+        )
+
+        with urllib.request.urlopen(request, timeout=30) as response:
+            xml_data = response.read()
+
+        print(f"DEBUG: Response length: {len(xml_data)}")
+
+        root = ET.fromstring(xml_data)
+
+        namespace = {
+            "atom": "http://www.w3.org/2005/Atom"
+        }
+
+        entries = []
+
+        for entry in root.findall("atom:entry", namespace):
+            id_el = entry.find("atom:id", namespace)
+            title_el = entry.find("atom:title", namespace)
+
+            if id_el is not None and title_el is not None:
+                arxiv_id = id_el.text.strip().split("/abs/")[-1]
+                title = " ".join(title_el.text.strip().split())
+
+                entries.append((arxiv_id, title))
+
+        print(f"DEBUG: Parsed papers: {len(entries)}")
+
+        return entries
+
+    except Exception as e:
+        print(f"DEBUG: arXiv request failed: {e}")
+        return []
 def extract_abstract(arxiv_id):
     """Extract abstract from arXiv abs page."""
     url = f'https://arxiv.org/abs/{arxiv_id}'
@@ -107,8 +136,12 @@ def register_source(url, title):
 
 def analyze_all(summaries):
     """Perform comprehensive analysis in ONE LLM call."""
-    # summaries is list of dict with id, title, abstract, cite_id
-    text = "\n\n".join([f"Paper {s['cite_id']} ({s['title']}):\nAbstract: {s['abstract']}" for s in summaries])
+    # Use clean sequential citation numbers for the report: [1], [2], [3].
+    # Grounded citation ledger IDs remain separate and unchanged internally.
+    text = "\n\n".join([
+        f"Paper [{idx}] ({s['title']}):\nAbstract: {s['abstract']}"
+        for idx, s in enumerate(summaries, start=1)
+    ])
     prompt = f"""You are a research assistant. Based on the following paper abstracts, perform a comprehensive literature review:
 
 1. Provide a summary for each paper including methods, findings, and limitations.
@@ -176,18 +209,25 @@ def main():
 
     print("\nAnalyzing papers (summarization, comparison, gaps, and steps)...")
     full_analysis = analyze_all(summaries_data)
-    print(f"\n--- Analysis Results ---\n{full_analysis}")
+
+    # The analysis prompt already uses clean sequential citation numbers [1], [2], [3].
+    normalized_analysis = full_analysis.replace('[7]', '[TEMP1]').replace('[1]', '[TEMP2]').replace('[8]', '[TEMP3]').replace('[TEMP1]', '[1]').replace('[TEMP2]', '[2]').replace('[TEMP3]', '[3]')
+
+    print(f"\n--- Analysis Results ---\n{normalized_analysis}")
 
     # Assemble brief
     brief = f"""# Research Brief
 
 **Research Question:** {question}
 
-{full_analysis}
+{normalized_analysis}
 """
 
-    # Render sources block
-    sources_block = render_sources_block(brief)
+    # Render sources block with clean sequential citation numbers.
+    sources_block = "## Sources\n" + "\n".join(
+        f"[{i}] https://arxiv.org/abs/{pid} - {title}"
+        for i, (pid, title) in enumerate(selected, start=1)
+    )
     print("\n--- Sources ---")
     print(sources_block)
 
@@ -197,13 +237,311 @@ def main():
     output_path = os.path.join(os.path.expanduser('~/ResearchMate'), 'research_brief.md')
     write_file(path=output_path, content=brief_with_sources)
     print(f"\nResearch brief written to: {output_path}")
+    export_report_files(brief_with_sources, os.path.dirname(output_path))
+def export_report_files(report_text, output_dir):
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    import re
 
-if __name__ == '__main__':
+    os.makedirs(output_dir, exist_ok=True)
+
+    # -------------------------
+    # Helpers for Word formatting
+    # -------------------------
+    def set_cell_shading(cell, fill):
+        tc_pr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), fill)
+        tc_pr.append(shd)
+
+    def clean_text(text):
+        """Remove Markdown/LaTeX artifacts that should not appear in Word."""
+        text = text.replace(r"\times", "Ã—")
+        text = text.replace(r"\pi", "Ï€")
+        text = text.replace(r"\le", "â‰¤")
+        text = text.replace(r"\ge", "â‰¥")
+        text = text.replace(r"\rightarrow", "â†’")
+        text = text.replace(r"\approx", "â‰ˆ")
+        text = text.replace(r"\pm", "Â±")
+        text = text.replace("$", "")
+        text = text.replace(r"\mathrm{", "")
+        text = text.replace(r"\text{", "")
+        text = text.replace("}", "") if r"\mathrm{" in text or r"\text{" in text else text
+        text = text.replace("root-Ï€", "root-Ï€")
+        return text.strip()
+
+    def add_formatted_paragraph(doc, text, bullet=False):
+        text = clean_text(text.strip())
+
+        # Remove Markdown bullet marker
+        if text.startswith("* "):
+            text = text[2:].strip()
+
+        # Remove numbered-list Markdown formatting when needed
+        if len(text) > 2 and text[0].isdigit() and text[1:3] == ". ":
+            text = text[3:].strip()
+
+        if not text:
+            doc.add_paragraph()
+            return
+
+        paragraph = (
+            doc.add_paragraph(style="List Bullet")
+            if bullet
+            else doc.add_paragraph()
+        )
+
+        # Convert **bold text** into real Word bold.
+        parts = text.split("**")
+        for idx, part in enumerate(parts):
+            if not part:
+                continue
+            run = paragraph.add_run(part)
+            if idx % 2 == 1:
+                run.bold = True
+
+        paragraph.paragraph_format.space_after = Pt(6)
+        paragraph.paragraph_format.line_spacing = 1.08
+
+    def parse_table_line(text):
+        """Return table cells from a Markdown pipe row."""
+        text = text.strip()
+        if text.count("|") < 2:
+            return None
+        parts = [clean_text(p.strip()) for p in text.strip("|").split("|")]
+        return parts if len(parts) >= 2 else None
+
+    def is_separator_row(parts):
+        return bool(parts) and all(
+            p and set(p) <= set("-: ")
+            for p in parts
+        )
+
+    def add_word_table(doc, rows):
+        if not rows:
+            return
+
+        # Normalize row lengths.
+        column_count = max(len(row) for row in rows)
+        normalized_rows = [
+            row + [""] * (column_count - len(row))
+            for row in rows
+        ]
+
+        table = doc.add_table(rows=1, cols=column_count)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = "Table Grid"
+        table.autofit = True
+
+        # Header
+        for col_idx, value in enumerate(normalized_rows[0]):
+            cell = table.rows[0].cells[col_idx]
+            cell.text = value.replace("**", "")
+            set_cell_shading(cell, "D9EAF7")
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.bold = True
+                    run.font.size = Pt(9)
+
+        # Body
+        for row_values in normalized_rows[1:]:
+            cells = table.add_row().cells
+            for col_idx, value in enumerate(row_values):
+                cells[col_idx].text = value.replace("**", "")
+                cells[col_idx].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+                for paragraph in cells[col_idx].paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(9)
+
+        doc.add_paragraph()
+
+    # -------------------------
+    # Create Word report
+    # -------------------------
+    doc = Document()
+
+    section = doc.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    section.left_margin = Inches(0.8)
+    section.right_margin = Inches(0.8)
+
+    normal_style = doc.styles["Normal"]
+    normal_style.font.name = "Times New Roman"
+    normal_style.font.size = Pt(11)
+
+    title = doc.add_heading("ResearchMate Research Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    subtitle = doc.add_paragraph("Automated Literature Review")
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle.runs[0].italic = True
+    subtitle.runs[0].font.size = Pt(11)
+
+    doc.add_paragraph()
+
+    lines = report_text.splitlines()
+    i = 0
+
+    while i < len(lines):
+        line = clean_text(lines[i].strip())
+
+        # Empty line
+        if not line:
+            i += 1
+            continue
+
+        # Markdown table.
+        # Detect any line containing multiple pipe separators, not only lines
+        # that literally start with "|" so the table is robust to formatting.
+        if line.count("|") >= 2:
+            table_lines = []
+
+            while i < len(lines):
+                current = lines[i].strip()
+                if current.count("|") < 2:
+                    break
+
+                parts = parse_table_line(current)
+                if parts and not is_separator_row(parts):
+                    table_lines.append(parts)
+                i += 1
+
+            if table_lines:
+                add_word_table(doc, table_lines)
+            continue
+
+        # Headings
+        if line.startswith("### "):
+            heading = doc.add_heading(clean_text(line[4:].strip()), level=2)
+            heading.paragraph_format.space_before = Pt(10)
+            heading.paragraph_format.space_after = Pt(5)
+            i += 1
+            continue
+
+        if line.startswith("## "):
+            heading = doc.add_heading(clean_text(line[3:].strip()), level=1)
+            heading.paragraph_format.space_before = Pt(12)
+            heading.paragraph_format.space_after = Pt(6)
+            i += 1
+            continue
+
+        if line.startswith("# "):
+            heading = doc.add_heading(clean_text(line[2:].strip()), level=1)
+            heading.paragraph_format.space_before = Pt(12)
+            heading.paragraph_format.space_after = Pt(6)
+            i += 1
+            continue
+
+        # Markdown bullets, including "* **Methods:** ..."
+        if re.match(r"^\*\s+", line):
+            add_formatted_paragraph(doc, re.sub(r"^\*\s+", "", line), bullet=True)
+            i += 1
+            continue
+
+        # Numbered list
+        if re.match(r"^\d+\.\s+", line):
+            add_formatted_paragraph(doc, line)
+            i += 1
+            continue
+
+        # Sources separator
+        if line.startswith("---"):
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_before = Pt(10)
+            paragraph.paragraph_format.space_after = Pt(4)
+            run = paragraph.add_run("Sources")
+            run.bold = True
+            run.font.size = Pt(12)
+            i += 1
+            continue
+
+        # Normal paragraph
+        add_formatted_paragraph(doc, line)
+        i += 1
+
+    word_path = os.path.join(output_dir, "ResearchMate_Report.docx")
+    doc.save(word_path)
+
+    # -------------------------
+    # Create Excel workbook
+    # -------------------------
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Research Brief"
+
+    ws["A1"] = "ResearchMate Research Brief"
+    ws["A1"].font = Font(name="Calibri", size=14, bold=True)
+
+    row = 3
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if stripped and "|" not in stripped:
+            ws.cell(
+                row=row,
+                column=1,
+                value=clean_text(stripped.replace("**", ""))
+            )
+            row += 1
+
+    ws.column_dimensions["A"].width = 120
+
+    # -------------------------
+    # Comparison table sheet
+    # -------------------------
+    comparison = wb.create_sheet("Paper Comparison")
+
+    comparison["A1"] = "Paper Comparison"
+    comparison["A1"].font = Font(name="Calibri", size=14, bold=True)
+
+    table_rows = []
+
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if stripped.count("|") >= 2:
+            parts = parse_table_line(stripped)
+            if parts and not is_separator_row(parts):
+                table_rows.append(parts)
+
+    for r_idx, values in enumerate(table_rows, start=3):
+        for c_idx, value in enumerate(values, start=1):
+            cell = comparison.cell(
+                row=r_idx,
+                column=c_idx,
+                value=clean_text(value.replace("**", ""))
+            )
+            cell.alignment = Alignment(
+                wrap_text=True,
+                vertical="top"
+            )
+
+            if r_idx == 3:
+                cell.font = Font(name="Calibri", bold=True)
+
+    for column_cells in comparison.columns:
+        column_letter = column_cells[0].column_letter
+        comparison.column_dimensions[column_letter].width = 30
+
+    excel_path = os.path.join(
+        output_dir,
+        "ResearchMate_Comparison.xlsx"
+    )
+    wb.save(excel_path)
+
+    print(f"\nWord report created: {word_path}")
+    print(f"Excel report created: {excel_path}")
+
+
+if __name__ == "__main__":
     main()
-
-
-
-
 
 
 
