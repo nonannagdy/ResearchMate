@@ -1,75 +1,59 @@
 # ResearchMate
 
-A simple automated literature review agent that turns a research question into a structured mini literature review with citations.
+ResearchMate is a lightweight research assistant that searches arXiv and creates a mini literature review for a research question. It aims to retrieve up to 30 papers, extract their abstracts, generate individual summaries in batches, compare the studies, and identify cautious research directions.
 
-## What it does
+## Features
 
-1. Accepts a research question from the user.
-2. Searches arXiv for recent relevant papers.
-3. Extracts abstracts of the top papers.
-4. Keeps track of sources and assigns stable numeric IDs.
-5. Uses the Hermes language model to summarize each paper's methods, key findings, and limitations, inserting inline citations.
-6. Generates a markdown table comparing the papers.
-7. Identifies research gaps and suggests next steps.
-8. Produces a final research brief with a formatted `Sources:` block.
-9. Saves the brief to `research_brief.md` in the same folder.
+- Searches arXiv for papers relevant to a user-provided question.
+- Retrieves paper titles, arXiv IDs, links, and abstracts.
+- Generates an individual summary for each successfully retrieved abstract (objective, methods, findings, limitations, and relevance), in batches of five papers.
+- Produces a comparison table and tentative research directions.
+- Exports a Markdown research brief, a Word report, and an Excel workbook with separate sheets for the brief, paper comparison, paper metadata/abstracts, and individual summaries.
 
-## Requirements
+## Important runtime requirement
 
-- Hermes Agent installed and accessible via the `hermes` command.
-- No paid API credits are required. The project uses Hermes built-in research tools and a free-tier LLM provider configured in Hermes.
+The current `main.py` is designed for the **Hermes Agent environment**. It invokes the `hermes` command-line tool and uses the Google Gemini `gemini-3.1-flash-lite` model through Hermes. It is not a standalone script for a plain Python installation unless you adapt `run_hermes_chat()` to a model provider you have configured.
 
-## Setup
+You need:
+- Python 3.10 or newer
+- Hermes Agent CLI installed and configured with Google/Gemini access
+- Python packages: `python-docx` and `openpyxl`
+- Network access to the arXiv API and arXiv abstract pages
 
-1. Ensure Hermes is installed and you can run `hermes` from a terminal.
-2. Clone or copy this folder to your desired location (e.g., `~/ResearchMate`).
-3. Open a terminal and navigate to the folder:
-   ```bash
-   cd ~/ResearchMate
-   ```
-4. Run the agent:
-   ```bash
-   & "C:\Users\dell\AppData\Local\hermes\tools\python-3.14.7+20260901-win32-x64\python.exe" .\main.py
-   ```
-5. Follow the prompts:
-   - Enter your research question when asked.
-   - The agent will automatically select the top three most recent arXiv papers, process them, and produce a brief.
-
-## Example
+Install the Python packages in the Python environment used to run the script:
 
 ```bash
-$ & "C:\Users\dell\AppData\Local\hermes\tools\python-3.14.7+20260901-win32-x64\python.exe" .\main.py
-=== ResearchMate: Automated Mini Literature Review ===
-Enter your research question: parameter-efficient fine-tuning of large language models
-
-Searching arXiv for recent papers...
-Top papers:
-1. [2405.12345] LoRA: Low-Rank Adaptation of Large Language Models
-2. [2405.23456] QLoRA: Efficient Finetuning of Quantized LLMs
-3. [2405.34567] AdaLoRA: Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning
-...
-
-Processing [...]
-...
-Research brief written to: /home/youruser/ResearchMate/research_brief.md
+python -m pip install -r requirements.txt
 ```
 
-Open `research_brief.md` to see the formatted literature review with citations.
+## Run
 
-## How it works (non‑programmer view)
+Run from the folder where you want the output to be created:
 
-- The script calls `hermes chat -q` to ask the built‑in AI to read abstracts and write summaries.
-- It uses the `grounded-citations` skill’s `sources.py` tool to register each arXiv abstract URL and retrieve a stable citation ID like `[1]`.
-- All citations in the final document refer to those IDs, and the `Sources:` block at the end lists the corresponding URLs.
-- No manual copying of links or formatting is required.
+```bash
+python main.py
+```
 
-## Troubleshooting
+When prompted, enter a focused research question, for example:
 
-- **No papers found**: Try a different or broader research question.
-- **Empty abstract**: The arXiv abstract page may have changed; the agent will warn and skip that paper.
-- **Heremes command not found**: Ensure Hermes is installed and its executable is in your PATH.
-- **Errors about missing modules**: The script relies only on the Python standard library and the Hermes‑provided `hermes_tools` module, which is available when running inside Hermes.
+```text
+Structural health monitoring and damage detection methods for long-span bridges under traffic and environmental loads
+```
 
-## License
+The output files are written to a `ResearchMate` folder inside the current user's home directory:
 
-MIT – feel free to adapt and extend.
+- `research_brief.md`
+- `ResearchMate_Report.docx`
+- `ResearchMate_Comparison.xlsx`
+
+## Notes and limitations
+
+- arXiv may return fewer than 30 results for a query, and some results may be only partially relevant. Always review the titles and abstracts before using the output in academic work.
+- The summaries are based on abstracts retrieved by the script, not necessarily full papers. Details absent from an abstract should not be treated as established findings.
+- Gemini free-tier quotas/rate limits may interrupt summaries or comparisons. The script attempts to retain a report structure when a model request fails, but generated summaries should be checked.
+- The project does not establish that a research gap is proven. Full-text review and independent verification are required before drawing academic conclusions.
+- arXiv is a preprint repository and does not cover all engineering journals or conference proceedings.
+
+## Suggested citation practice
+
+Use the generated arXiv links to verify each paper. Cite the original paper or published version—not the ResearchMate-generated summary—in any thesis or publication.

@@ -1,4 +1,4 @@
-﻿# ResearchMate - Simple automated literature review agent
+# ResearchMate - Simple automated literature review agent
 # Runs inside Hermes environment, uses only free tools.
 import os
 import sys
@@ -44,11 +44,11 @@ SOURCES_SCRIPT = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'herm
 
 def run_hermes_chat(prompt):
     """Run hermes chat -q <prompt> -Q with prompt and return output."""
-    proc = subprocess.run(['hermes', 'chat', '--query-file', '-', '--oneshot', '-Q', '--provider', 'google', '--model', 'gemini-3.1-flash-lite'], input=prompt, capture_output=True, text=True)
+    proc = subprocess.run(['hermes', 'chat', '--query-file', '-', '--oneshot', '-Q', '--provider', 'google', '--model', 'gemini-3.1-flash-lite'], input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace")
     response = proc.stdout.strip()
     if not response or "error" in response.lower() or "404" in response or "429" in response:
         # Fallback to default if provider fails
-        proc = subprocess.run(['hermes', 'chat', '--query-file', '-', '--oneshot', '-Q', '--provider', 'google', '--model', 'gemini-3.1-flash-lite'], input=prompt, capture_output=True, text=True)
+        proc = subprocess.run(['hermes', 'chat', '--query-file', '-', '--oneshot', '-Q', '--provider', 'google', '--model', 'gemini-3.1-flash-lite'], input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace")
         response = proc.stdout.strip()
     return response
 
@@ -67,12 +67,12 @@ def search_arxiv(query, max_results=5):
     if not query_terms:
         return []
 
-    search_query = " AND ".join(f"all:{w}" for w in query_terms)
+    search_query = " OR ".join(f'all:{w}' for w in query_terms[:5])
 
     params = urllib.parse.urlencode({
         "search_query": search_query,
         "max_results": max_results,
-        "sortBy": "submittedDate",
+        "sortBy": "relevance",
         "sortOrder": "descending"
     })
 
@@ -134,29 +134,77 @@ def register_source(url, title):
     # Expected output like [1]
     return out
 
-def analyze_all(summaries):
-    """Perform comprehensive analysis in ONE LLM call."""
-    # Use clean sequential citation numbers for the report: [1], [2], [3].
-    # Grounded citation ledger IDs remain separate and unchanged internally.
-    text = "\n\n".join([
-        f"Paper [{idx}] ({s['title']}):\nAbstract: {s['abstract']}"
-        for idx, s in enumerate(summaries, start=1)
-    ])
-    prompt = f"""You are a research assistant. Based on the following paper abstracts, perform a comprehensive literature review:
+def analyze_all(summaries, question):
+    """Summarize every paper in small batches, then compare all papers."""
+    import re
 
-1. Provide a summary for each paper including methods, findings, and limitations.
-2. Provide a markdown comparison table summarizing Methods, Findings, and Limitations.
-3. Identify research gaps and suggest concrete next steps.
+    if not summaries:
+        return "No papers were successfully retrieved."
 
-Use citation IDs (e.g. [1]) where appropriate.
-Format the output with Markdown headers:
-## Summaries
+    # Keep the model prompt manageable: 5 papers per request instead of all 30.
+    individual_sections = []
+    batch_size = 5
+    for start_idx in range(0, len(summaries), batch_size):
+        batch = summaries[start_idx:start_idx + batch_size]
+        batch_start_number = start_idx + 1
+        papers_text = "\n\n".join(
+            f"Paper [{idx}] — {paper['title']}\nAbstract: {paper['abstract']}"
+            for idx, paper in enumerate(batch, start=batch_start_number)
+        )
+        prompt = f'''You are a rigorous academic literature-review assistant.
+Research question: {question}
+
+Summarize EVERY paper supplied below. Do not omit any paper. Use only its title and abstract; do not invent methods, results, numbers, or limitations. If a detail is absent, write "Not specified in the abstract." Assess relevance honestly; label low or partial relevance if appropriate.
+
+For EACH paper, use the exact numeric ID and exact title shown in the input (never write the placeholder N):
+### Paper [exact number] — Exact full title
+- Relevance: High / Partial / Low — reason
+- Objective: ...
+- Methods: ...
+- Main findings: ...
+- Limitations: ...
+- Relevance to my research: ...
+
+Return only these paper summaries. No introduction, no comparison table, no overall conclusion.
+
+Papers to summarize:
+{papers_text}'''
+        print(f"Summarizing papers {batch_start_number}-{batch_start_number + len(batch) - 1}...")
+        batch_result = run_hermes_chat(prompt)
+        if not batch_result or any(marker in batch_result.lower() for marker in ["429 too many requests", "quota exceeded", "resource_exhausted", "no response"]):
+            # Preserve every paper in the report rather than silently dropping it.
+            batch_result = "\n\n".join(
+                f"### Paper [{idx}] — {paper['title']}\n"
+                "- Relevance: Not assessed — the model request failed.\n"
+                "- Objective: Not assessed because the summary request failed.\n"
+                "- Methods: Not specified; retry the analysis when the model is available.\n"
+                "- Main findings: Not specified; retry the analysis when the model is available.\n"
+                "- Limitations: The abstract could not be analyzed by the model.\n"
+                "- Relevance to my research: Requires manual review."
+                for idx, paper in enumerate(batch, start=batch_start_number)
+            )
+        individual_sections.append(batch_result.strip())
+
+    summaries_text = "\n\n".join(individual_sections)
+    compact_summaries = summaries_text[:36000]
+    comparison_prompt = f'''You are a rigorous academic research assistant.
+Research question: {question}
+
+Using ONLY the paper summaries below, create:
 ## Comparison Table
-## Research Gaps & Next Steps
+A Markdown table with one row for EVERY paper, columns: Paper, Relevance, Objective, Methods, Main findings, Limitations. Keep cells concise but useful. Do not omit rows.
 
-Abstracts:
-{text}"""
-    return run_hermes_chat(prompt)
+## Research Gaps & Next Steps
+Separate (A) observations supported by these abstracts from (B) tentative research directions that require reading full papers. Do not claim a gap is proven by abstracts alone. Do not infer gaps from unrelated papers. Use citations [1] through [{len(summaries)}] for specific claims.
+
+Paper summaries:
+{compact_summaries}'''
+    print("Comparing all paper summaries and identifying cautious research directions...")
+    comparison_result = run_hermes_chat(comparison_prompt)
+    if not comparison_result or "429 too many requests" in comparison_result.lower() or "quota exceeded" in comparison_result.lower():
+        comparison_result = "## Comparison Table\n\nThe comparison table could not be generated because the model was unavailable. The individual summaries and paper details are still saved.\n\n## Research Gaps & Next Steps\n\nReview the individual summaries and full papers before making claims about research gaps."
+
+    return "## Summaries\n\n" + summaries_text + "\n\n" + comparison_result.strip()
 
 def render_sources_block(brief_text):
     """Render the Sources block from the grounded-citations ledger."""
@@ -174,7 +222,7 @@ def main():
         return
 
     print("\nSearching arXiv for recent papers...")
-    papers = search_arxiv(question, max_results=10)
+    papers = search_arxiv(question, max_results=30)
     if not papers:
         print("No papers found. Try a different query.")
         return
@@ -183,8 +231,8 @@ def main():
     for idx, (pid, title) in enumerate(papers, start=1):
         print(f"{idx}. [{pid}] {title}")
 
-    # Select top 3 automatically (non-programmer friendly)
-    selected = papers[:3]
+    # Process up to 30 papers and create an individual summary for every paper with an abstract.
+    selected = papers[:30]
     print(f"\nSelected top {len(selected)} papers for review.")
 
     summaries_data = []
@@ -207,11 +255,11 @@ def main():
         print("Failed to process any papers.")
         return
 
-    print("\nAnalyzing papers (summarization, comparison, gaps, and steps)...")
-    full_analysis = analyze_all(summaries_data)
+    print(f"\nAnalyzing {len(summaries_data)} papers (individual summaries in batches, comparison, and research directions)...")
+    full_analysis = analyze_all(summaries_data, question)
 
-    # The analysis prompt already uses clean sequential citation numbers [1], [2], [3].
-    normalized_analysis = full_analysis.replace('[7]', '[TEMP1]').replace('[1]', '[TEMP2]').replace('[8]', '[TEMP3]').replace('[TEMP1]', '[1]').replace('[TEMP2]', '[2]').replace('[TEMP3]', '[3]')
+    # Keep the full analysis for all successfully processed papers.
+    normalized_analysis = full_analysis
 
     print(f"\n--- Analysis Results ---\n{normalized_analysis}")
 
@@ -225,8 +273,8 @@ def main():
 
     # Render sources block with clean sequential citation numbers.
     sources_block = "## Sources\n" + "\n".join(
-        f"[{i}] https://arxiv.org/abs/{pid} - {title}"
-        for i, (pid, title) in enumerate(selected, start=1)
+        f"[{i}] https://arxiv.org/abs/{paper['id']} - {paper['title']}"
+        for i, paper in enumerate(summaries_data, start=1)
     )
     print("\n--- Sources ---")
     print(sources_block)
@@ -237,8 +285,8 @@ def main():
     output_path = os.path.join(os.path.expanduser('~/ResearchMate'), 'research_brief.md')
     write_file(path=output_path, content=brief_with_sources)
     print(f"\nResearch brief written to: {output_path}")
-    export_report_files(brief_with_sources, os.path.dirname(output_path))
-def export_report_files(report_text, output_dir):
+    export_report_files(brief_with_sources, os.path.dirname(output_path), summaries_data)
+def export_report_files(report_text, output_dir, paper_data=None):
     from docx import Document
     from docx.shared import Pt, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -474,66 +522,185 @@ def export_report_files(report_text, output_dir):
     # -------------------------
     # Create Excel workbook
     # -------------------------
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Research Brief"
 
+    # Clean, readable report sheet: separate section names from content.
+    ws.merge_cells("A1:B1")
     ws["A1"] = "ResearchMate Research Brief"
-    ws["A1"].font = Font(name="Calibri", size=14, bold=True)
+    ws["A1"].font = Font(name="Calibri", size=16, bold=True, color="FFFFFF")
+    ws["A1"].fill = PatternFill(fill_type="solid", fgColor="244062")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 32
+    ws["A2"] = "Section"
+    ws["B2"] = "Details"
+    for header_cell in (ws["A2"], ws["B2"]):
+        header_cell.font = Font(name="Calibri", bold=True, color="FFFFFF")
+        header_cell.fill = PatternFill(fill_type="solid", fgColor="4472C4")
+        header_cell.alignment = Alignment(horizontal="center", vertical="center")
 
     row = 3
+    current_section = "Research Brief"
     for line in report_text.splitlines():
         stripped = line.strip()
-        if stripped and "|" not in stripped:
-            ws.cell(
-                row=row,
-                column=1,
-                value=clean_text(stripped.replace("**", ""))
-            )
-            row += 1
+        if not stripped:
+            continue
+        if stripped.startswith("---"):
+            continue
+        if stripped.startswith("|") and stripped.count("|") >= 2:
+            # Keep the comparison table on its own worksheet, not as a long line here.
+            continue
+        if stripped.startswith("#"):
+            current_section = clean_text(stripped.lstrip("# ")) or "Section"
+            continue
+        content = clean_text(stripped.replace("**", ""))
+        if not content:
+            continue
+        ws.cell(row=row, column=1, value=current_section)
+        ws.cell(row=row, column=2, value=content)
+        ws.cell(row=row, column=1).font = Font(name="Calibri", size=10, bold=True, color="244062")
+        ws.cell(row=row, column=2).font = Font(name="Calibri", size=10)
+        for col in (1, 2):
+            ws.cell(row=row, column=col).alignment = Alignment(vertical="top", wrap_text=True)
+        ws.row_dimensions[row].height = 42 if len(content) > 140 else 28
+        row += 1
 
-    ws.column_dimensions["A"].width = 120
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 100
+    ws.freeze_panes = "A3"
+    ws.sheet_view.showGridLines = False
+    ws.auto_filter.ref = f"A2:B{ws.max_row}" if ws.max_row >= 2 else "A1:B1"
 
-    # -------------------------
-    # Comparison table sheet
-    # -------------------------
+    # Comparison table sheet: extract Markdown comparison rows
     comparison = wb.create_sheet("Paper Comparison")
-
     comparison["A1"] = "Paper Comparison"
-    comparison["A1"].font = Font(name="Calibri", size=14, bold=True)
+    comparison["A1"].font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+    comparison["A1"].fill = PatternFill(fill_type="solid", fgColor="244062")
+    comparison.merge_cells("A1:F1")
+    comparison["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    comparison.row_dimensions[1].height = 30
 
     table_rows = []
-
+    in_comparison = False
     for line in report_text.splitlines():
         stripped = line.strip()
-        if stripped.count("|") >= 2:
+        if stripped.lstrip("# ").lower().startswith("comparison table"):
+            in_comparison = True
+            continue
+        if in_comparison and stripped.startswith("## "):
+            break
+        if in_comparison and stripped.count("|") >= 2:
             parts = parse_table_line(stripped)
             if parts and not is_separator_row(parts):
                 table_rows.append(parts)
 
-    for r_idx, values in enumerate(table_rows, start=3):
+    for r_idx, values in enumerate(table_rows, start=2):
         for c_idx, value in enumerate(values, start=1):
-            cell = comparison.cell(
-                row=r_idx,
-                column=c_idx,
-                value=clean_text(value.replace("**", ""))
-            )
-            cell.alignment = Alignment(
-                wrap_text=True,
-                vertical="top"
-            )
-
-            if r_idx == 3:
-                cell.font = Font(name="Calibri", bold=True)
+            cell = comparison.cell(row=r_idx, column=c_idx, value=clean_text(value.replace("**", "")))
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            if r_idx == 2:
+                cell.font = Font(name="Calibri", bold=True, color="FFFFFF")
+                cell.fill = PatternFill(fill_type="solid", fgColor="4472C4")
+            else:
+                cell.font = Font(name="Calibri", size=10)
+                cell.border = Border(bottom=Side(style="thin", color="D9E2F3"))
 
     for column_cells in comparison.columns:
-        column_letter = column_cells[0].column_letter
+        column_letter = get_column_letter(column_cells[0].column)
         comparison.column_dimensions[column_letter].width = 30
+    comparison.freeze_panes = "A3"
+    comparison.sheet_view.showGridLines = False
+    if comparison.max_row >= 2:
+        comparison.auto_filter.ref = f"A2:{get_column_letter(comparison.max_column)}{comparison.max_row}"
 
-    excel_path = os.path.join(
-        output_dir,
-        "ResearchMate_Comparison.xlsx"
-    )
+    # Apply consistent wrapping to the report sheet
+    for row_cells in ws.iter_rows():
+        for cell in row_cells:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.auto_filter.ref = f"A3:A{ws.max_row}" if ws.max_row >= 3 else "A1:A1"
+
+    # Sheet 3: metadata and abstracts for every successfully processed paper.
+    papers_ws = wb.create_sheet("30 Papers")
+    paper_headers = ["No.", "Title", "arXiv ID", "URL", "Abstract"]
+    papers_ws.append(paper_headers)
+    for cell in papers_ws[1]:
+        cell.font = Font(name="Calibri", bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="4472C4")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    # Include all paper metadata and the full abstract used for summarization.
+    for idx, paper in enumerate(paper_data or [], start=1):
+        papers_ws.append([idx, paper.get("title", ""), paper.get("id", ""),
+                          f"https://arxiv.org/abs/{paper.get('id', '')}", paper.get("abstract", "")])
+    for col, width in {"A":8,"B":55,"C":18,"D":36,"E":65}.items():
+        papers_ws.column_dimensions[col].width = width
+    papers_ws.freeze_panes = "A2"
+    papers_ws.auto_filter.ref = papers_ws.dimensions
+    papers_ws.sheet_view.showGridLines = False
+    for row_cells in papers_ws.iter_rows(min_row=2):
+        for cell in row_cells:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # Sheet 4: individual summaries, parsed from the structured report headings.
+    summaries_ws = wb.create_sheet("Individual Summaries")
+    summaries_ws.append(["Paper", "Relevance", "Objective", "Methods", "Main findings", "Limitations", "Relevance to my research"])
+    for cell in summaries_ws[1]:
+        cell.font = Font(name="Calibri", bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="4472C4")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    summary_rows = []
+    current = None
+    fields = {"Relevance": "", "Objective": "", "Methods": "", "Main findings": "", "Limitations": "", "Relevance to my research": ""}
+    field_aliases = {"main findings":"Main findings", "findings":"Main findings", "objective":"Objective", "methods":"Methods", "limitations":"Limitations", "relevance to my research":"Relevance to my research", "relevance":"Relevance"}
+    def flush_summary():
+        if current:
+            summary_rows.append([current] + [fields[k] for k in ["Relevance", "Objective", "Methods", "Main findings", "Limitations", "Relevance to my research"]])
+    in_summaries = False
+    for ln in report_text.splitlines():
+        st = ln.strip()
+        if st.lower().startswith("## summaries"):
+            in_summaries = True
+            continue
+        if in_summaries and st.startswith("## "):
+            flush_summary()
+            current = None
+            break
+        if not in_summaries:
+            continue
+        if st.startswith("### Paper"):
+            flush_summary()
+            current = clean_text(st.lstrip("# "))
+            fields = {"Relevance": "", "Objective": "", "Methods": "", "Main findings": "", "Limitations": "", "Relevance to my research": ""}
+            continue
+        if current and st.startswith("-") and ":" in st:
+            key, value = st.lstrip("- ").split(":", 1)
+            norm = key.strip().lower()
+            if norm in field_aliases:
+                fields[field_aliases[norm]] = clean_text(value.strip())
+        elif current and st and not st.startswith("|"):
+            # Preserve any extra explanation in the objective field rather than dropping it.
+            if not fields["Objective"]:
+                fields["Objective"] = clean_text(st)
+    else:
+        flush_summary()
+    for row_values in summary_rows:
+        summaries_ws.append(row_values)
+    for col, width in {"A":38,"B":28,"C":42,"D":42,"E":48,"F":42,"G":42}.items():
+        summaries_ws.column_dimensions[col].width = width
+    summaries_ws.freeze_panes = "A2"
+    summaries_ws.auto_filter.ref = summaries_ws.dimensions
+    summaries_ws.sheet_view.showGridLines = False
+    for row_cells in summaries_ws.iter_rows(min_row=2):
+        for cell in row_cells:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for ridx in range(2, summaries_ws.max_row + 1):
+        summaries_ws.row_dimensions[ridx].height = 90
+
+    excel_path = os.path.join(output_dir, "ResearchMate_Comparison.xlsx")
     wb.save(excel_path)
 
     print(f"\nWord report created: {word_path}")
